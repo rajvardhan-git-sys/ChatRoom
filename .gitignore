@@ -1,0 +1,19 @@
+# Visual Studio
+.vs/
+
+# Build files
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# Build folders
+Debug/
+Release/
+x64/
+x86/
+
+# VS Code
+.vscode/
