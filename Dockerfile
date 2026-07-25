@@ -8,12 +8,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /usr/src/app
 
-COPY chatRoom.cpp chatRoom.hpp message.hpp ./
+COPY chatRoom.cpp chatRoom.hpp message.hpp html_content.hpp ./
 
-# Compile the server
 RUN g++ -std=c++17 chatRoom.cpp -o chatRoom -lboost_system -lpthread
 
-# The port environment variable default
 ENV PORT=8080
 
 EXPOSE $PORT

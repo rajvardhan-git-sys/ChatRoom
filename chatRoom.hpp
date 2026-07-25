@@ -1,51 +1,88 @@
-#include <iostream>
-
 #ifndef CHATROOM_HPP
 #define CHATROOM_HPP
 
-#include "message.hpp"
+#include <iostream>
+#include <string>
 #include <deque>
 #include <set>
 #include <memory>
 
-#include <iostream>
 #include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/websocket.hpp>
 
-using boost::asio::ip::tcp;
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
 
+// Abstract base for any connected client
 class Participant {
-    public: 
-        virtual void deliver(Message& message) = 0;
-        virtual void write(Message &message) = 0;
-        virtual ~Participant() = default;
+public:
+    virtual void send(const std::string& msg) = 0;
+    virtual ~Participant() = default;
 };
 
-typedef std::shared_ptr<Participant> ParticipantPointer;
+using ParticipantPtr = std::shared_ptr<Participant>;
 
-class Room{
-    public:
-        void join(ParticipantPointer participant);
-        void leave(ParticipantPointer participant);
-        void deliver(ParticipantPointer participantPointer, Message &message);
-    private:
-        std::deque<Message> messageQueue;
-        enum {maxParticipants = 100};
-        std::set<ParticipantPointer> participants;
+// Manages all connected clients and message broadcasting
+class Room {
+public:
+    void join(ParticipantPtr participant);
+    void leave(ParticipantPtr participant);
+    void broadcast(const std::string& message, ParticipantPtr sender);
+private:
+    std::set<ParticipantPtr> participants_;
 };
 
-class Session: public Participant, public std::enable_shared_from_this<Session>{
-    public:
-        Session(tcp::socket s, Room &room);
-        void start();
-        void deliver(Message& message);
-        void write(Message &message);
-        void async_read();
-        void async_write(std::string messageBody, size_t messageLength);
-    private:
-        tcp::socket clientSocket;
-        boost::asio::streambuf buffer;
-        Room& room;
-        std::deque<Message> messageQueue; 
+// Handles a WebSocket connection
+class WebSocketSession : public Participant,
+                          public std::enable_shared_from_this<WebSocketSession> {
+public:
+    WebSocketSession(tcp::socket socket, Room& room);
+    void run(http::request<http::string_body> req);
+    void send(const std::string& msg) override;
+private:
+    void onAccept(beast::error_code ec);
+    void doRead();
+    void onRead(beast::error_code ec, std::size_t bytes_transferred);
+    void doWrite();
+
+    websocket::stream<beast::tcp_stream> ws_;
+    Room& room_;
+    beast::flat_buffer buffer_;
+    std::deque<std::string> writeQueue_;
+    bool writing_ = false;
 };
 
-#endif //CHATROOM_HPP
+// Handles initial HTTP connection — serves HTML or upgrades to WebSocket
+class HttpSession : public std::enable_shared_from_this<HttpSession> {
+public:
+    HttpSession(tcp::socket socket, Room& room);
+    void run();
+private:
+    void doRead();
+    void handleRequest();
+
+    beast::tcp_stream stream_;
+    Room& room_;
+    beast::flat_buffer buffer_;
+    http::request<http::string_body> req_;
+};
+
+// Accepts incoming TCP connections
+class Listener : public std::enable_shared_from_this<Listener> {
+public:
+    Listener(net::io_context& ioc, tcp::endpoint endpoint, Room& room);
+    void run();
+private:
+    void doAccept();
+
+    net::io_context& ioc_;
+    tcp::acceptor acceptor_;
+    Room& room_;
+};
+
+#endif // CHATROOM_HPP

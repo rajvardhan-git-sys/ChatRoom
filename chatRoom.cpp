@@ -3,138 +3,238 @@
 #endif
 
 #include "chatRoom.hpp"
+#include "html_content.hpp"
+#include <cstdlib>
 
-/*
-when client joins, it should join a room.
-hence a session(socket, room) will be created and this client will have a session
-now, whenever it wants to start its delivery it call call start() function, where it will listen for incoming messages and push to the message Queue of the room
-when client wants to send message it can call session's deliver() message
-session will call deliver() to deliver the message to the room
-room will call write() function to write any message to the client's queue
-It will trigger the write() for each participant except the sender itself
-*/
+// =========================================================================
+// Room
+// =========================================================================
 
-void Room::join(ParticipantPointer participant){
-    this->participants.insert(participant);
+void Room::join(ParticipantPtr participant) {
+    participants_.insert(participant);
+    std::cout << "Client joined. Total: " << participants_.size() << std::endl;
 }
 
-void Room::leave(ParticipantPointer participant){
-    this->participants.erase(participant);
+void Room::leave(ParticipantPtr participant) {
+    participants_.erase(participant);
+    std::cout << "Client left. Total: " << participants_.size() << std::endl;
 }
 
-void Room::deliver(ParticipantPointer participant, Message &message){
-    messageQueue.push_back(message);
-    while (!messageQueue.empty()) {
-        Message msg = messageQueue.front();
-        messageQueue.pop_front(); 
-        
-        for (ParticipantPointer _participant : participants) {
-            if (participant != _participant) {
-                _participant->write(msg);
-            }
+void Room::broadcast(const std::string& message, ParticipantPtr sender) {
+    for (auto& p : participants_) {
+        if (p != sender) {
+            p->send(message);
         }
     }
 }
 
-void Session::async_read() {
-    auto self(shared_from_this());
-    boost::asio::async_read_until(clientSocket, buffer, "\n",
-        [this, self](boost::system::error_code ec, std::size_t bytes_transferred) {
-            if (!ec) {
-                std::string data(boost::asio::buffers_begin(buffer.data()), 
-                                 boost::asio::buffers_begin(buffer.data()) + bytes_transferred);
-                buffer.consume(bytes_transferred);
-                std::cout << "Received: " << data << std::endl;
-                
-                Message message(data);
-                deliver(message);
-                async_read(); 
+// =========================================================================
+// WebSocketSession
+// =========================================================================
+
+WebSocketSession::WebSocketSession(tcp::socket socket, Room& room)
+    : ws_(std::move(socket)), room_(room) {}
+
+void WebSocketSession::run(http::request<http::string_body> req) {
+    ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+    ws_.set_option(websocket::stream_base::decorator(
+        [](websocket::response_type& res) {
+            res.set(http::field::server, "ChatRoom");
+        }));
+
+    ws_.async_accept(req,
+        [self = shared_from_this()](beast::error_code ec) {
+            self->onAccept(ec);
+        });
+}
+
+void WebSocketSession::send(const std::string& msg) {
+    writeQueue_.push_back(msg);
+    if (!writing_) {
+        doWrite();
+    }
+}
+
+void WebSocketSession::onAccept(beast::error_code ec) {
+    if (ec) {
+        std::cerr << "WebSocket accept error: " << ec.message() << std::endl;
+        return;
+    }
+    room_.join(shared_from_this());
+    doRead();
+}
+
+void WebSocketSession::doRead() {
+    ws_.async_read(buffer_,
+        [self = shared_from_this()](beast::error_code ec, std::size_t bytes) {
+            self->onRead(ec, bytes);
+        });
+}
+
+void WebSocketSession::onRead(beast::error_code ec, std::size_t) {
+    if (ec) {
+        if (ec != websocket::error::closed) {
+            std::cerr << "WebSocket read error: " << ec.message() << std::endl;
+        }
+        room_.leave(shared_from_this());
+        return;
+    }
+
+    std::string message = beast::buffers_to_string(buffer_.data());
+    buffer_.consume(buffer_.size());
+
+    std::cout << "Message: " << message << std::endl;
+    room_.broadcast(message, shared_from_this());
+    doRead();
+}
+
+void WebSocketSession::doWrite() {
+    if (writeQueue_.empty()) {
+        writing_ = false;
+        return;
+    }
+    writing_ = true;
+    ws_.text(true);
+    ws_.async_write(net::buffer(writeQueue_.front()),
+        [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) {
+                std::cerr << "WebSocket write error: " << ec.message() << std::endl;
+                self->room_.leave(self);
+                return;
+            }
+            self->writeQueue_.pop_front();
+            self->doWrite();
+        });
+}
+
+// =========================================================================
+// HttpSession
+// =========================================================================
+
+HttpSession::HttpSession(tcp::socket socket, Room& room)
+    : stream_(std::move(socket)), room_(room) {}
+
+void HttpSession::run() {
+    doRead();
+}
+
+void HttpSession::doRead() {
+    req_ = {};
+    stream_.expires_after(std::chrono::seconds(30));
+    http::async_read(stream_, buffer_, req_,
+        [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) return;
+            self->handleRequest();
+        });
+}
+
+void HttpSession::handleRequest() {
+    // WebSocket upgrade request
+    if (websocket::is_upgrade(req_)) {
+        auto ws = std::make_shared<WebSocketSession>(stream_.release_socket(), room_);
+        ws->run(std::move(req_));
+        return;
+    }
+
+    // Serve the HTML chat page
+    http::response<http::string_body> res;
+
+    if (req_.method() == http::verb::get &&
+        (req_.target() == "/" || req_.target() == "/index.html")) {
+        res.result(http::status::ok);
+        res.set(http::field::content_type, "text/html; charset=utf-8");
+        res.body() = getHtmlPage();
+    } else {
+        res.result(http::status::not_found);
+        res.set(http::field::content_type, "text/plain");
+        res.body() = "Not Found";
+    }
+
+    res.version(req_.version());
+    res.set(http::field::server, "ChatRoom");
+    res.keep_alive(req_.keep_alive());
+    res.prepare_payload();
+
+    auto sp = std::make_shared<http::response<http::string_body>>(std::move(res));
+    auto self = shared_from_this();
+    http::async_write(stream_, *sp,
+        [self, sp](beast::error_code ec, std::size_t) {
+            if (!ec && sp->keep_alive()) {
+                self->doRead();
             } else {
-                room.leave(shared_from_this());
-                if (ec == boost::asio::error::eof) {
-                    std::cout << "Connection closed by peer" << std::endl;
-                } else {
-                    std::cout << "Read error: " << ec.message() << std::endl;
-                }
+                beast::error_code shutdown_ec;
+                self->stream_.socket().shutdown(tcp::socket::shutdown_send, shutdown_ec);
             }
-        }
-    );
+        });
 }
 
+// =========================================================================
+// Listener
+// =========================================================================
 
-void Session::async_write(std::string messageBody, size_t messageLength){
-    auto write_handler = [&](boost::system::error_code ec, std::size_t bytes_transferred){
-        if(!ec){
-            std::cout<<"Data is written to the socket: "<<std::endl;
-        }else{
-            std::cerr << "Write error: " << ec.message() << std::endl;
-        }
-    };
-    boost::asio::async_write(clientSocket, boost::asio::buffer(messageBody, messageLength), write_handler);
+Listener::Listener(net::io_context& ioc, tcp::endpoint endpoint, Room& room)
+    : ioc_(ioc), acceptor_(ioc), room_(room) {
+    beast::error_code ec;
+
+    acceptor_.open(endpoint.protocol(), ec);
+    if (ec) throw std::runtime_error("Open: " + ec.message());
+
+    acceptor_.set_option(net::socket_base::reuse_address(true), ec);
+    if (ec) throw std::runtime_error("Set option: " + ec.message());
+
+    acceptor_.bind(endpoint, ec);
+    if (ec) throw std::runtime_error("Bind: " + ec.message());
+
+    acceptor_.listen(net::socket_base::max_listen_connections, ec);
+    if (ec) throw std::runtime_error("Listen: " + ec.message());
 }
 
-void Session::start(){
-    room.join(shared_from_this());
-    async_read();
+void Listener::run() {
+    doAccept();
 }
 
-Session::Session(tcp::socket s, Room& r): clientSocket(std::move(s)), room(r){};
-
-void Session::write(Message &message){
-    messageQueue.push_back(message);
-    while(messageQueue.size() != 0){
-        Message message = messageQueue.front();
-        messageQueue.pop_front();
-        bool header_decode = message.decodeHeader();
-        if(header_decode){
-            std::string body = message.getBody(); 
-            async_write(body, message.getBodyLength());
-        }else{
-            std::cout<<"Message length exceeds the max length"<<std::endl;
-        }
-    }
+void Listener::doAccept() {
+    acceptor_.async_accept(ioc_,
+        [self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
+            if (!ec) {
+                std::make_shared<HttpSession>(std::move(socket), self->room_)->run();
+            } else {
+                std::cerr << "Accept error: " << ec.message() << std::endl;
+            }
+            self->doAccept();
+        });
 }
 
-void Session::deliver(Message& incomingMessage){
-    room.deliver(shared_from_this(), incomingMessage);
-}
-using boost::asio::ip::address_v4;
+// =========================================================================
+// Main
+// =========================================================================
 
-void accept_connection(boost::asio::io_context &io, char *port,tcp::acceptor &acceptor, Room &room, const tcp::endpoint& endpoint) {
-    tcp::socket socket(io);
-    acceptor.async_accept([&](boost::system::error_code ec, tcp::socket socket) {
-        if(!ec) {
-            std::shared_ptr<Session> session = std::make_shared<Session>(std::move(socket), room);
-            session->start();
-        }
-        accept_connection(io, port,acceptor, room, endpoint);
-    });
-}
-
-
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
     try {
         const char* port_str = nullptr;
-        if(argc >= 2) {
+        if (argc >= 2) {
             port_str = argv[1];
         } else {
             port_str = std::getenv("PORT");
             if (!port_str) {
-                std::cerr << "Usage: server <port> OR set PORT environment variable\n";
+                std::cerr << "Usage: chatRoom <port> OR set PORT environment variable\n";
                 return 1;
             }
         }
+
+        auto port = static_cast<unsigned short>(std::atoi(port_str));
+
+        net::io_context ioc;
         Room room;
-        boost::asio::io_context io_context;
-        tcp::endpoint endpoint(tcp::v4(), std::atoi(port_str));
-        tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), std::atoi(port_str)));
-        
-        char* port_arg = const_cast<char*>(port_str);
-        accept_connection(io_context, port_arg, acceptor, room, endpoint);
-        io_context.run();
-    }
-    catch (std::exception& e) {
-        std::cerr << "Exception: " << e.what() << "\n";
+
+        auto listener = std::make_shared<Listener>(
+            ioc, tcp::endpoint(tcp::v4(), port), room);
+        listener->run();
+
+        std::cout << "ChatRoom server running on port " << port << std::endl;
+        ioc.run();
+    } catch (std::exception& e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
     }
     return 0;
 }
