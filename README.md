@@ -35,7 +35,7 @@ This framing lets the receiver know exactly how many bytes to read for the body,
 ## Requirements
 
 - A C++17-capable compiler (tested with MSVC from Visual Studio, via the Developer Command Prompt)
-- [Boost](https://www.boost.org/) (specifically `boost::asio`)
+- [Boost](https://www.boost.org/)  (specifically `boost::asio`)
 - On Windows, [vcpkg](https://github.com/microsoft/vcpkg) is the easiest way to install Boost
 
 ## Building

@@ -1,0 +1,8 @@
+.git
+.gitignore
+.vs
+*.exe
+*.obj
+images/
+client.cpp
+README.md

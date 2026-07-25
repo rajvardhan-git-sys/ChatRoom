@@ -24,15 +24,24 @@ void async_read(tcp::socket &socket) {
 
 int main(int argc, char* argv[]){
     if(argc < 2){
-        std::cerr << "Provide port too as second argument" << std::endl;
+        std::cerr << "Usage: client [<host>] <port>" << std::endl;
         return 1;
+    }
+    
+    std::string host = "127.0.0.1";
+    std::string port;
+    if (argc == 2) {
+        port = argv[1];
+    } else {
+        host = argv[1];
+        port = argv[2];
     }
     
     boost::asio::io_context io_context;
     tcp::socket socket(io_context);
     tcp::resolver resolver(io_context);
 
-    boost::asio::connect(socket, resolver.resolve("127.0.0.1", argv[1]));
+    boost::asio::connect(socket, resolver.resolve(host, port));
 
     async_read(socket);
 

@@ -112,15 +112,23 @@ void accept_connection(boost::asio::io_context &io, char *port,tcp::acceptor &ac
 
 int main(int argc, char *argv[]) {
     try {
-        if(argc < 2) {
-            std::cerr << "Usage: server <port> [<port> ...]\n";
-            return 1;
+        const char* port_str = nullptr;
+        if(argc >= 2) {
+            port_str = argv[1];
+        } else {
+            port_str = std::getenv("PORT");
+            if (!port_str) {
+                std::cerr << "Usage: server <port> OR set PORT environment variable\n";
+                return 1;
+            }
         }
         Room room;
         boost::asio::io_context io_context;
-        tcp::endpoint endpoint(tcp::v4(), atoi(argv[1]));
-        tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), std::atoi(argv[1])));
-        accept_connection(io_context, argv[1], acceptor, room, endpoint);
+        tcp::endpoint endpoint(tcp::v4(), std::atoi(port_str));
+        tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), std::atoi(port_str)));
+        
+        char* port_arg = const_cast<char*>(port_str);
+        accept_connection(io_context, port_arg, acceptor, room, endpoint);
         io_context.run();
     }
     catch (std::exception& e) {
